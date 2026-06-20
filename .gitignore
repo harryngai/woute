@@ -2,3 +2,4 @@
 *.log
 *.conf
 !sample.conf
+__pycache__/
