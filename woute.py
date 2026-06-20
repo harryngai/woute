@@ -2,11 +2,13 @@
 """woute - Route traffic through WireGuard tunnels on macOS"""
 
 import asyncio
+import atexit
 import ipaddress
 import json
 import logging
 import os
 import re
+import resource
 import select
 import shutil
 import signal
@@ -212,6 +214,9 @@ async def _state_dumper(config: Config, conf_path, started_ts: float):
 
 # ── SOCKS5 proxy lifecycle ────────────────────────────────
 
+_proxy_active = False   # True while the system SOCKS proxy points at woute
+
+
 def _active_services() -> list:
     r = subprocess.run(["networksetup", "-listallnetworkservices"],
                        capture_output=True, text=True, check=False)
@@ -220,11 +225,21 @@ def _active_services() -> list:
 
 
 def _sys_proxy(host: Optional[str] = None, port: int = 0):
+    global _proxy_active
     for svc in _active_services():
         if host:
             subprocess.run(["networksetup", "-setsocksfirewallproxy", svc, host, str(port)], check=False)
         subprocess.run(["networksetup", "-setsocksfirewallproxystate", svc, "on" if host else "off"], check=False)
+    _proxy_active = bool(host)
     log.warning(f"SOCKS5 proxy set → {host}:{port}" if host else "SOCKS5 proxy cleared")
+
+
+def _proxy_safety_net():
+    # Last resort, runs at interpreter exit: if woute is dying with the system proxy
+    # still pointed at it, clear it so the machine isn't stranded behind a dead proxy.
+    if _proxy_active:
+        try: _sys_proxy()
+        except Exception: pass
 
 
 # ── Rule matching ─────────────────────────────────────────
@@ -478,6 +493,19 @@ async def _reload_watcher(config: Config):
 
 # ── Log setup ─────────────────────────────────────────────
 
+def _raise_fd_limit():
+    # A busy proxy needs far more descriptors than the macOS launchd default (256).
+    # Running out is what used to take woute — and the whole machine — offline.
+    try: soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (ValueError, OSError): return
+    for want in (65536, 24576, 10240, 4096):
+        if want <= soft: return
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, want))
+            log.warning(f"fd limit raised {soft} → {want}"); return
+        except (ValueError, OSError): continue
+
+
 def _setup_logging(level: str, retention_days: int):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     p = LOG_DIR / f"woute-{time.strftime('%Y%m%d')}.log"
@@ -493,13 +521,24 @@ def _setup_logging(level: str, retention_days: int):
 
 # ── Async core ────────────────────────────────────────────
 
+_emfile_log_ts = 0.0
+
 async def main_async(config: Config, wg_manager: Optional[WireGuardManager], conf_path):
     loop = asyncio.get_running_loop()
 
     def _exc_handler(loop, ctx):
+        global _emfile_log_ts
         exc = ctx.get("exception")
         if isinstance(exc, OSError) and exc.errno == 24:
-            log.error("fd limit reached — shutting down"); loop.stop(); return
+            # EMFILE — too many open files. This is transient: asyncio already pauses
+            # accept() and retries. Stopping the loop here would kill the daemon and
+            # strand the system SOCKS proxy, taking the whole machine offline — so we
+            # shed the failing connection and keep serving instead.
+            now = time.monotonic()
+            if now - _emfile_log_ts > 10:
+                _emfile_log_ts = now
+                log.warning("fd limit hit — shedding connections until it clears")
+            return
         loop.default_exception_handler(ctx)
     loop.set_exception_handler(_exc_handler)
 
@@ -514,6 +553,7 @@ async def main_async(config: Config, wg_manager: Optional[WireGuardManager], con
     log.warning(f"{len(config.tunnels)} tunnel(s), {len(config.rules)} rule(s)")
 
     _sys_proxy(config.listen_host, config.listen_port)
+    atexit.register(_proxy_safety_net)
     started_ts = time.time()
     try:
         asyncio.create_task(tunnel_monitor(config))
@@ -650,6 +690,7 @@ def main_start(fg: bool, run_tests: bool = True):
 
     config = parse_config(CONF_PATH)
     _setup_logging(config.log_level, config.log_retention_days)
+    _raise_fd_limit()
     signal.signal(signal.SIGHUP, _sighup_handler)
 
     wg_manager = None
